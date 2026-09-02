@@ -134,7 +134,7 @@ export function runArwProofVerbose(p, off, carrier, ctx) {
     if (!results.readPrimitivePass)
         fail("INIT", "READ-PRIMITIVE-PASS", "not seen during establishPrimitive");
     else
-        pass("INIT", "READ-PRIMITIVE-PASS", "slopkit-core carrier validated");
+        pass("INIT", "READ-PRIMITIVE-PASS", "dummykit-core carrier validated");
 
     step("CARRIER", "ANCHORS", "exploit-controlled objects from core.js");
     if (carrier) {

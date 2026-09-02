@@ -266,7 +266,7 @@ async function runPipeline() {
         log("OFFSETS", detected.off.fw_status);
 
     try {
-        log("STEP", "═══ PHASE 1: slopkit-core primitive ═══");
+        log("STEP", "═══ PHASE 1: dummykit-core primitive ═══");
         const carrier = await establishPrimitive({
             maxAttempts: 0,
             skipTrimDebris: true,
