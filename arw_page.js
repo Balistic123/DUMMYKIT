@@ -1,6 +1,6 @@
 /** Auto-run: primitive → 2e Leak+lk → R/W proof (GitHub Pages bundle). */
 import { int64 } from "./int64.js";
-import { offsetsFor } from "./ps4_offsets_userland.js";
+import { offsetsFor, offsetsForKey } from "./ps4_offsets_userland.js";
 import { installWindowP, pairStatus } from "./mem.js";
 import { establishPrimitive, trimExploitDebris, getCoreNative } from "./core.js";
 import { runArwProofVerbose } from "./arw_proof.js";
@@ -9,13 +9,15 @@ import {
     persistSessionBases, saveLibkernelSession, saveLastFnPtr,
 } from "./libkernel_resolve.js";
 
-const BUILD = "arw-standalone-4";
+const BUILD = "arw-standalone-5";
 const LOG_MAX = 1200;
+const TARGET_FW = "13.52";
 
 const params = new URLSearchParams(location.search);
 const VERBOSE_PRIM = params.get("verbose") === "1";
 const PROBE_MODULES = params.get("modules") === "1";
 const NO_AUTO = params.get("noauto") === "1";
+const FORCE_FW = params.get("force") === "1";
 const lines = [];
 const retain = [];
 let started = false;
@@ -52,6 +54,74 @@ function state(msg, cls) {
 
 function groomLabel() {
     return params.get("g") || "default";
+}
+
+/** Parse PS4 firmware from WebKit User-Agent (retail browser string). */
+function parsePs4Ua(ua) {
+    ua = ua || "";
+    if (/PlayStation\s+5/i.test(ua))
+        return { platform: "ps5", key: null, snippet: ua.slice(0, 96) };
+    const m = ua.match(/PlayStation\s+4[\/\s](\d+)\.(\d+)/i);
+    if (!m)
+        return { platform: "other", key: null, snippet: ua.slice(0, 96) };
+    const key = m[1] + "." + parseInt(m[2], 10).toString(10).padStart(2, "0");
+    return { platform: "ps4", key, snippet: m[0] };
+}
+
+/**
+ * Hard gate: this bundle is HW-tuned for PS4 13.52 only.
+ * @returns {{ ok: boolean, key: string|null, forced?: boolean, reason?: string }}
+ */
+function verifyTargetFirmware() {
+    const ua = navigator.userAgent || "";
+    log("UA-RAW", ua.length > 140 ? ua.slice(0, 140) + "…" : ua);
+
+    const parsed = parsePs4Ua(ua);
+    if (parsed.platform === "ps5") {
+        return {
+            ok: false,
+            key: null,
+            reason: "PlayStation 5 detected — this page is PS4 13.52 only",
+        };
+    }
+    if (parsed.platform !== "ps4") {
+        if (FORCE_FW) {
+            log("FW-WARN", "UA is not PlayStation 4 — force=1 dev override");
+            return { ok: true, key: TARGET_FW, forced: true };
+        }
+        return {
+            ok: false,
+            key: null,
+            reason: "Not a PS4 browser (User-Agent has no PlayStation 4/x.xx)",
+        };
+    }
+
+    log("FW-DETECT", "PS4 " + parsed.key + "  (" + parsed.snippet + ")");
+
+    if (parsed.key === TARGET_FW) {
+        log("FW-OK", "PS4 " + TARGET_FW + " confirmed via User-Agent");
+        return { ok: true, key: parsed.key, forced: false };
+    }
+
+    if (FORCE_FW) {
+        log("FW-WARN", "UA says PS4 " + parsed.key + " — force=1 override (offsets wrong)");
+        return { ok: true, key: parsed.key, forced: true };
+    }
+
+    return {
+        ok: false,
+        key: parsed.key,
+        reason: "Wrong firmware: User-Agent reports PS4 " + parsed.key
+            + " — this build requires PS4 " + TARGET_FW,
+    };
+}
+
+function resolveOffsets(fwCheck) {
+    if (fwCheck.forced) {
+        const forced = offsetsForKey(TARGET_FW);
+        if (forced.off) return forced;
+    }
+    return offsetsFor(navigator.userAgent);
 }
 
 function parseAddr(raw) {
@@ -167,11 +237,32 @@ async function runPipeline() {
     try { sessionStorage.removeItem("wk-arw-log"); } catch (_) { }
 
     state("running…", "warn");
-    log("BOOT", BUILD + "  groom=" + groomLabel() + "  auto=1");
+    log("BOOT", BUILD + "  target=PS4-" + TARGET_FW + "  groom=" + groomLabel() + "  auto=1");
 
-    const detected = offsetsFor(navigator.userAgent);
-    log("UA-FW", (detected.key || "unknown") + (detected.off ? "  offsets loaded" : "  NO OFFSETS"));
-    if (detected.off && detected.off.fw_status)
+    const fwCheck = verifyTargetFirmware();
+    if (!fwCheck.ok) {
+        log("FW-BLOCK", fwCheck.reason || "firmware check failed");
+        if (fwCheck.key)
+            log("FW-HINT", "detected PS4 " + fwCheck.key + " — need " + TARGET_FW);
+        log("FW-HINT", "desktop dev only: add ?force=1 (will use wrong offsets on real HW)");
+        state("wrong firmware — PS4 " + TARGET_FW + " only", "bad");
+        flushLogSession();
+        started = false;
+        return;
+    }
+
+    const detected = resolveOffsets(fwCheck);
+    if (!detected.off) {
+        log("FW-BLOCK", "no offset table for PS4 " + (detected.key || TARGET_FW));
+        state("offsets missing", "bad");
+        flushLogSession();
+        started = false;
+        return;
+    }
+
+    log("UA-FW", detected.key + "  offsets loaded"
+        + (fwCheck.forced ? "  (force → " + TARGET_FW + " table)" : ""));
+    if (detected.off.fw_status)
         log("OFFSETS", detected.off.fw_status);
 
     try {

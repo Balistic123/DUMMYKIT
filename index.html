@@ -28,8 +28,9 @@ if (!location.search)
   <div id="state">Arbitrary R/W proof</div>
   <p id="hint">
     Auto-runs on load: <b>primitive</b> → <b>2e Leak+lk</b> → <b>R/W proof</b>.
-    Includes <code>ps4_offsets_userland.js</code> (13.52 HW). Success: <b>arbitrary r/w achieved</b>.
-    Options: <code>?g=drain:512</code> · <code>?full=1</code> (2e) · <code>?modules=1</code> (ELF peek @ session bases only)
+    <b>PS4 13.52 only</b> — firmware checked via User-Agent before anything runs.
+    Success: <b>arbitrary r/w achieved</b>.
+    Options: <code>?g=drain:512</code> · <code>?modules=1</code> · <code>?force=1</code> (dev override)
   </p>
   <div id="out"></div>
 </div>
